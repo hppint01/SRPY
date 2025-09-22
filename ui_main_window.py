@@ -1,30 +1,22 @@
 import os
-import matplotlib.dates as mdates
-import numpy as np
-
-from PySide6.QtWidgets import (QMainWindow, QPushButton, QTextEdit,
-                               QVBoxLayout, QWidget, QFileDialog,
-                               QSlider, QToolBar, QMessageBox, QMenuBar, 
-                               QInputDialog, QDialog)
-from PySide6.QtGui import QAction, QIcon
-from PySide6.QtCore import Qt, QSize
-
-from config import WINDOW_SIZE, TRACE_COLORS
-from data_loader import load_mseed
-from plot_canvas import MplCanvas, trace_time_axis
+import csv
 from datetime import timedelta
 
-MAX_TIMESPAN_SECONDS = 30 * 24 * 60 * 60   # 30 days
+import matplotlib.dates as mdates
+import numpy as np
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QDoubleSpinBox,
+                                QFileDialog, QFormLayout, QInputDialog,
+                                QMainWindow, QMessageBox, QMenuBar,
+                                QPushButton, QSpinBox, QTextEdit, QToolBar,
+                                QVBoxLayout, QWidget)
 
-def _bounded_timedelta(seconds: float) -> timedelta:
-    """Return a timedelta limited to MAX_TIMESPAN_SECONDS."""
-    if seconds > MAX_TIMESPAN_SECONDS:
-        # Show the full span in the title instead of trying to plot it.
-        return timedelta(seconds=MAX_TIMESPAN_SECONDS)
-    return timedelta(seconds=int(seconds))
+from config import TRACE_COLORS, WINDOW_SIZE
+from data_loader import load_mseed
+from plot_canvas import MplCanvas, trace_time_axis
+from func_clean_3 import calculate_vh_data
 
-SLIDER_STEP = 1
-DEFAULT_ZOOM_FACTOR = 1.5
 
 class SpectrogramWindow(QDialog):
     def __init__(self, stream, parent=None):
@@ -37,7 +29,7 @@ class SpectrogramWindow(QDialog):
         layout.addWidget(self.canvas)
         self.setLayout(layout)
 
-        self.plot_spectogram()
+        self.plot_spectrogram()
 
     def plot_spectrogram(self):
         try:
@@ -54,6 +46,86 @@ class SpectrogramWindow(QDialog):
 
         except Exception as e:
             QMessageBox.critical(self,"Error", f"Could not plot spectogram: {e}")
+
+class VHInputDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calculate V/H Ratio")
+
+        self.layout = QFormLayout(self)
+
+        self.window_len = QSpinBox(self)
+        self.window_len.setRange(1, 3600)  # 1 second to 1 hour
+        self.window_len.setValue(60)
+        self.layout.addRow("Window Length (s):", self.window_len)
+
+        self.shift_len = QSpinBox()
+        self.shift_len.setRange(1, 3600)
+        self.shift_len.setValue(30)
+        self.layout.addRow("Shift Length (s):", self.shift_len) 
+
+        self.cft_min = QDoubleSpinBox()
+        self.cft_min.setRange(0.0, 10.0)
+        self.cft_min.setValue(0.3)
+        self.cft_min.setSingleStep(0.1)
+        self.layout.addRow("STA/LTA Min", self.cft_min)
+
+        self.cft_max = QDoubleSpinBox()
+        self.cft_max.setRange(0.0, 10.0)
+        self.cft_max.setValue(3.0)
+        self.cft_max.setSingleStep(0.1)
+        self.layout.addRow("STA/LTA Max", self.cft_max)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self) 
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        self.layout.addWidget(self.button_box)
+
+    def get_params(self):
+        return {
+            "windows": self.window_len.value(),
+            "shift": self.shift_len.value(),
+            "cft_min": self.cft_min.value(),
+            "cft_max": self.cft_max.value()
+        }
+    
+class VHResultWindow(QDialog):
+    def __init__(self, vh_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("V/H Ratio Result")
+        self.resize(800, 600)
+
+        layout = QVBoxLayout()
+        self.canvas = MplCanvas(self, n_axes=1)
+        layout.addWidget(self.canvas)
+        self.setLayout(layout)
+        self.plot(vh_data)
+    
+    def plot(self, results):
+        ax = self.canvas.axes[0]
+        ax.clear()
+
+        if not results:
+            ax.text(0.5, 0.5, "No V/H ratio data available", ha='center', va='center')  
+            self.canvas.draw()
+            return
+        
+        for vh_curve in results["VperH_array"]:
+            ax.plot(results["freq"], vh_curve, color='gray', alpha=0.5)
+
+        ax.plot(results["freq"], results["median"], color='black', linewidth=2, label='Median')
+        ax.plot(results["freq"], results["q1"], color='black', linewidth=1, linestyle='dashed')
+        ax.plot(results["freq"], results["q3"], color='black', linewidth=1, linestyle='dashed')
+        ax.plot(results["freq"], results["mean"], color='red', linewidth=2, label='Mean')
+
+        ax.set_title(f"V/H Ratio (Window: {results['window_len']}s, Shift: {results['shift_len']}s)")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("V/H Ratio")
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.grid(True, which='both', linestyle='--', alpha=0.6)
+        ax.legend()
+        self.canvas.draw()
 
 
 class MainWindow(QMainWindow):
@@ -96,6 +168,9 @@ class MainWindow(QMainWindow):
         self.act_spectrogram = QAction("Spectrogram...", self)
         self.act_spectrogram.setEnabled(False)
 
+        self.act_vh_analysis = QAction("Calculate V/H Ratio...", self)
+        self.act_vh_analysis.setEnabled(False)
+
         self.act_about = QAction("About SRPY", self)
 
     def _build_ui(self):
@@ -120,6 +195,7 @@ class MainWindow(QMainWindow):
 
         analysis_menu = menubar.addMenu("&Analysis")
         analysis_menu.addAction(self.act_spectrogram)
+        analysis_menu.addAction(self.act_vh_analysis)
 
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction(self.act_about)
@@ -143,13 +219,13 @@ class MainWindow(QMainWindow):
 
         self.canvas = MplCanvas(self, width=8, height=6, dpi=100, n_axes=3)
 
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setEnabled(False)
+        # self.slider = QSlider(Qt.Horizontal)
+        # self.slider.setEnabled(False)
 
         layout.addWidget(self.button_open)
         layout.addWidget(self.text_properties)
         layout.addWidget(self.canvas)
-        layout.addWidget(self.slider)
+        # layout.addWidget(self.slider)
 
         container = QWidget()
         container.setLayout(layout)
@@ -157,7 +233,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         self.button_open.clicked.connect(self.open_file)
-        self.slider.valueChanged.connect(self.update_plot_view)
+        # self.slider.valueChanged.connect(self.update_plot_view)
         self.act_open.triggered.connect(self.open_file)
         self.act_save.triggered.connect(self.save_file)
         self.act_export.triggered.connect(self.export_file)
@@ -167,6 +243,8 @@ class MainWindow(QMainWindow):
         self.act_downsample.triggered.connect(self.downsample)
         self.act_about.triggered.connect(self.show_about)
         self.act_spectrogram.triggered.connect(self.show_spectrogram)
+        self.act_vh_analysis.triggered.connect(self.show_vh_analysis_dialog)
+
 
         self.canvas.mpl_connect("scroll_event", self.on_scroll)
         self.canvas.mpl_connect("button_press_event", self.on_mouse_press)
@@ -185,7 +263,7 @@ class MainWindow(QMainWindow):
             self.current_filename, self.stream = load_mseed(file_path)
             self.text_properties.setPlainText(str(self.stream))
             self.plot_waveform()
-            self.setup_slider()
+            # self.setup_slider()
 
             self.act_save.setEnabled(True)
             self.act_export.setEnabled(True)
@@ -193,11 +271,12 @@ class MainWindow(QMainWindow):
             self.act_upsample.setEnabled(True)
             self.act_downsample.setEnabled(True)
             self.act_spectrogram.setEnabled(True)
+            self.act_vh_analysis.setEnabled(True)
 
         except Exception as exc:
             self.text_properties.setPlainText(f"Error: {exc}")
             self.stream = None
-            self.slider.setEnabled(False)
+            # self.slider.setEnabled(False)
 
             self.act_save.setEnabled(False)
             self.act_export.setEnabled(False)
@@ -205,6 +284,7 @@ class MainWindow(QMainWindow):
             self.act_upsample.setEnabled(False)
             self.act_downsample.setEnabled(False)
             self.act_spectrogram.setEnabled(False)
+            self.act_vh_analysis.setEnabled(False)
 
     def show_spectrogram(self):
         if not self.stream:
@@ -214,6 +294,22 @@ class MainWindow(QMainWindow):
         self.spectrogram_window = SpectrogramWindow(self.stream, self)
         self.spectrogram_window.resize(600, 800)
         self.spectrogram_window.show()
+
+    def show_vh_analysis_dialog(self):
+        if not self.stream:
+            QMessageBox.warning(self, "No Data", "Please open a waveform file first.")
+            return
+        
+        dialog = VHInputDialog(self)
+        if dialog.exec():
+            params = dialog.get_params()
+            try:
+                vh_data = calculate_vh_data(self.stream, **params)
+                result_window = VHResultWindow(vh_data, self)
+                result_window.resize(800, 600)
+                result_window.exec()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to calculate V/H ratio: {e}")
 
     def save_file(self):
         if not self.stream:
@@ -290,58 +386,73 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Downsample", f"The stream would be down-sampled by a factor of {factor}.")
         self.plot_waveform()
 
+
+    # Define a constant for the initial window size in seconds
+
+
     def plot_waveform(self):
         if not self.stream:
+            for ax in self.canvas.axes:
+                ax.clear()
+            self.canvas.draw()
             return
-        
+
         for ax in self.canvas.axes:
             ax.clear()
 
+        # Loop and plot the data
         for i, trace in enumerate(self.stream):
             ax = self.canvas.axes[i]
-            times = trace_time_axis(trace)
-            ax.plot(times, trace.data, color=TRACE_COLORS[i], linewidth=0.5)
-            #ax.plot(trace.data, color=TRACE_COLORS[i], linewidth=0.5)
-            ax.set_ylabel(trace.id, rotation=0, labelpad=25)
+        
+            utcdatetimes = trace.times("utcdatetime")
+            times_np = np.array([t.datetime for t in utcdatetimes])
+            times_mpl = mdates.date2num(times_np)
+            data = trace.data
+        
+            ax.plot(times_mpl, data, color=TRACE_COLORS[i], linewidth=0.5)
+            ax.set_ylabel(trace.id, rotation=0, labelpad=30, ha='right', va='center')
             ax.grid(True, linestyle="--", alpha=0.6)
             ax.xaxis_date()
             ax.xaxis.set_major_formatter(
-                #mdates.DateFormatter('%Y-%m-%d %H:%M:%S')
                 mdates.DateFormatter('%H:%M:%S')
             )
+    
+        # The conditional zoom logic has been removed.
+        # Matplotlib will now automatically show the full duration.
 
+        # Set title and redraw
         title = self.current_filename or "Seismic Waveform Components"
         self.canvas.axes[0].set_title(title)
-
+        self.canvas.figure.tight_layout()
         self.canvas.draw()
 
     def show_about(self):
         QMessageBox.about(self, "About SRPY",
                           "On Progress")
 
-    def setup_slider(self):
-        if not self.stream:
-            self.slider.setEnabled(False)
-            return
+    # def setup_slider(self):
+    #     if not self.stream:
+    #         self.slider.setEnabled(False)
+    #         return
         
-        total_samples = self.stream[0].stats.npts
+    #     total_samples = self.stream[0].stats.npts
 
-        if total_samples > WINDOW_SIZE:
-            self.slider.setEnabled(True)
-            self.slider.setRange(0, 1000)
-            self.slider.setValue(0)
-            self.update_plot_view(0)
+    #     if total_samples > WINDOW_SIZE:
+    #         self.slider.setEnabled(True)
+    #         self.slider.setRange(0, 1000)
+    #         self.slider.setValue(0)
+    #         self.update_plot_view(0)
 
-        else:
-            self.slider.setEnabled(False)
-            start_dt = self.stream[0].stats.starttime.datetime
-            total_seconds = (total_samples - 1) / self.stream[0].stats.sampling_rate
-            # Use the bounded helper
-            end_dt = start_dt + _bounded_timedelta(total_seconds)
+    #     else:
+    #         self.slider.setEnabled(False)
+    #         start_dt = self.stream[0].stats.starttime.datetime
+    #         total_seconds = (total_samples - 1) / self.stream[0].stats.sampling_rate
+    #         # Use the bounded helper
+    #         end_dt = start_dt + _bounded_timedelta(total_seconds)
 
-            for ax in self.canvas.axes:
-                ax.set_xlim(start_dt, end_dt)
-            self.canvas.draw()
+    #         for ax in self.canvas.axes:
+    #             ax.set_xlim(start_dt, end_dt)
+    #         self.canvas.draw()
     
     def update_plot_view(self, slider_pos: int):
         if not self.stream:
@@ -385,23 +496,33 @@ class MainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def on_mouse_press(self, event):
-        if event.button != 1 or not self.stream:
+        if event.button != 1 or not self.stream or event.xdata is None:
             return
-        self._pan_start = (event.xdata, event.ydata)
+        # PERBAIKAN: Ganti nama variabel agar konsisten
+        self._pan_start_dt = mdates.num2date(event.xdata).replace(tzinfo=None)
         self._orig_limits = [ax.get_xlim() for ax in self.canvas.axes]
 
     def on_mouse_move(self, event):
-        if not hasattr(self, "_pan_start") or event.xdata is None:
+        # PERBAIKAN: Sekarang pengecekan ini akan berhasil
+        if not hasattr(self, "_pan_start_dt") or event.xdata is None:
             return
         
-        dx = event.xdata - self._pan_start[0]
+        current_dt = mdates.num2date(event.xdata).replace(tzinfo=None)
+        # PERBAIKAN: Variabel ini sekarang ada
+        time_delta = current_dt - self._pan_start_dt
 
-        for ax, (orig_min, orig_max) in zip(self.canvas.axes, self._orig_limits):
-            ax.set_xlim(orig_min - dx, orig_max - dx)
+        for ax, (orig_min_num, orig_max_num) in zip(self.canvas.axes, self._orig_limits):
+            # Kita tidak perlu konversi lagi di sini karena batasnya sudah numerik
+            new_min_num = orig_min_num - mdates.date2num(time_delta)
+            new_max_num = orig_max_num - mdates.date2num(time_delta)
+
+            ax.set_xlim(mdates.num2date(new_min_num), mdates.num2date(new_max_num))
+        
         self.canvas.draw_idle()
 
     def on_mouse_release(self, event):
-        if hasattr(self, "_pan_start"):
-            del self._pan_start
+        # PERBAIKAN: Pengecekan ini juga sekarang benar
+        if hasattr(self, "_pan_start_dt"):
+            del self._pan_start_dt
             del self._orig_limits
         

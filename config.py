@@ -1,2 +1,2 @@
-WINDOW_SIZE = 5000
+WINDOW_SIZE = 200000
 TRACE_COLORS = ["b", "g", "r"]
