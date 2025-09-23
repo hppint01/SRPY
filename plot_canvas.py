@@ -12,9 +12,10 @@ from datetime import timedelta
 
 
 class MplCanvas(FigureCanvasQTAgg):
-    def __init__(self, parent=None, width=8, height=6, dpi=100, n_axes=1):
+    def __init__(self, parent=None, width=8, height=6, dpi=100, n_axes=1, sharex=True):
         fig = Figure(figsize=(width, height), dpi=dpi, tight_layout=True)
-        self.axes = fig.subplots(n_axes, 1, sharex=True)
+
+        self.axes = fig.subplots(n_axes, 1, sharex=sharex)
         if n_axes == 1:
              self.axes = [self.axes]
         super().__init__(fig)

@@ -1,21 +1,24 @@
 import os
 import csv
+import traceback
 from datetime import timedelta
+from scipy.signal import savgol_filter as sgolay
 
 import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                 QFileDialog, QFormLayout, QInputDialog,
                                 QMainWindow, QMessageBox, QMenuBar,
                                 QPushButton, QSpinBox, QTextEdit, QToolBar,
-                                QVBoxLayout, QWidget)
+                                QVBoxLayout, QWidget, QProgressDialog)
 
 from config import TRACE_COLORS, WINDOW_SIZE
 from data_loader import load_mseed
 from plot_canvas import MplCanvas, trace_time_axis
-from func_clean_3 import calculate_vh_data
+from func_clean_3 import calculate_vh_data, calculate_psd_for_gui, calculate_polar_for_gui
 
 
 class SpectrogramWindow(QDialog):
@@ -85,12 +88,13 @@ class VHInputDialog(QDialog):
         return {
             "windows": self.window_len.value(),
             "shift": self.shift_len.value(),
-            "cft_min": self.cft_min.value(),
-            "cft_max": self.cft_max.value()
+            "cft_max": self.cft_max.value(),
+            "cft_min": self.cft_min.value()
         }
+
     
 class VHResultWindow(QDialog):
-    def __init__(self, vh_data, parent=None):
+    def __init__(self, vh_data, colors, parent=None):
         super().__init__(parent)
         self.setWindowTitle("V/H Ratio Result")
         self.resize(800, 600)
@@ -99,9 +103,9 @@ class VHResultWindow(QDialog):
         self.canvas = MplCanvas(self, n_axes=1)
         layout.addWidget(self.canvas)
         self.setLayout(layout)
-        self.plot(vh_data)
+        self.plot(vh_data, colors)
     
-    def plot(self, results):
+    def plot(self, results, colors):
         ax = self.canvas.axes[0]
         ax.clear()
 
@@ -110,15 +114,23 @@ class VHResultWindow(QDialog):
             self.canvas.draw()
             return
         
-        for vh_curve in results["VperH_array"]:
-            ax.plot(results["freq"], vh_curve, color='gray', alpha=0.5)
+        for i, vh_curve in enumerate (results["VperH_array"]):
+            ax.plot(results["freq"], vh_curve, color=colors[i], alpha=0.5)
 
         ax.plot(results["freq"], results["median"], color='black', linewidth=2, label='Median')
+
         ax.plot(results["freq"], results["q1"], color='black', linewidth=1, linestyle='dashed')
         ax.plot(results["freq"], results["q3"], color='black', linewidth=1, linestyle='dashed')
+
         ax.plot(results["freq"], results["mean"], color='red', linewidth=2, label='Mean')
 
-        ax.set_title(f"V/H Ratio (Window: {results['window_len']}s, Shift: {results['shift_len']}s)")
+        peak_vh = results["median"].max()
+        peak_freq = results["freq"][results["median"].argmax()]
+        ax.axvline(peak_freq, color='blue', linestyle='--', label=f'Peak: {peak_vh:.2f} at {peak_freq:.2f} Hz') 
+
+        title = (f"V/H Ratio - {results['window_count']} valid windows\n"
+                 f"Window: {results['window_len']}s, Shift: {results['shift_len']}s ")
+        ax.set_title(title)
         ax.set_xlabel("Frequency (Hz)")
         ax.set_ylabel("V/H Ratio")
         ax.set_xscale('log')
@@ -127,6 +139,213 @@ class VHResultWindow(QDialog):
         ax.legend()
         self.canvas.draw()
 
+class PSDInputDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calculate Power Spectral Density (PSD)")
+
+        self.layout = QFormLayout(self)
+
+        self.window_len = QSpinBox(self); self.window_len.setRange(1, 3600); self.window_len.setValue(60)
+        self.layout.addRow("Window Length (s):", self.window_len)
+
+        self.shift_len = QSpinBox(); self.shift_len.setRange(1, 3600); self.shift_len.setValue(30)
+        self.layout.addRow("Shift Length (s):", self.shift_len) 
+
+        self.cft_min = QDoubleSpinBox(); self.cft_min.setRange(0.0, 10.0); self.cft_min.setValue(0.3); self.cft_min.setSingleStep(0.1)
+        self.layout.addRow("STA/LTA Min", self.cft_min)
+
+        self.cft_max = QDoubleSpinBox(); self.cft_max.setRange(0.0, 10.0); self.cft_max.setValue(3.0); self.cft_max.setSingleStep(0.1)
+        self.layout.addRow("STA/LTA Max", self.cft_max)
+        
+        self.dip_tres = QSpinBox(); self.dip_tres.setRange(0, 90); self.dip_tres.setValue(45)
+        self.layout.addRow("Dip Threshold (°):", self.dip_tres)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self) 
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        self.layout.addWidget(self.button_box)
+    def get_params(self):
+        return {
+            "windows": self.window_len.value(),
+            "shift": self.shift_len.value(),
+            "cft_max": self.cft_max.value(),
+            "cft_min": self.cft_min.value(),
+            "dip_tres": self.dip_tres.value()
+        }
+
+class PSDResultWindow(QDialog):
+    def __init__(self, psd_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PSD Result")
+        self.resize(800, 800)
+
+        layout = QVBoxLayout()
+        self.canvas = MplCanvas(self, n_axes=3)
+        layout.addWidget(self.canvas)
+        self.setLayout(layout)
+        self.plot(psd_data)
+
+    def plot(self, results):
+        if not results:
+            self.canvas.axes[0].text(0.5, 0.5, "No PSD data available", ha='center', va='center')
+            self.canvas.draw()
+            return
+        
+        freq = results["freq"]
+        all_psd_arrays = [results["psd_Z_array"], results["psd_N_array"], results["psd_E_array"]]
+        mean_psds = [results["mean_psd_Z"], results["mean_psd_N"], results["mean_psd_E"]]
+        components = ["Z", "N", "E"]
+
+        for i in range(3):
+            ax = self.canvas.axes[i]
+            ax.clear()
+
+            for psd_curve in all_psd_arrays[i]:
+                ax.plot(freq, 10 * np.log10(psd_curve), color='gray', alpha=0.1)
+            
+            
+            mean_psd_smoothed = sgolay(10 * np.log10(mean_psds[i]), 101, 2) # 101 window, 2 order
+            
+          
+            ax.plot(freq, mean_psd_smoothed, color='black', linewidth=2, label=f'Mean PSD ({components[i]})')
+
+            ax.set_ylabel("PSD [dB]")
+            ax.set_xscale('log')
+            ax.grid(True, which='both', linestyle='--', alpha=0.6)
+            ax.legend(loc='upper right')
+           
+            if components[i] == 'Z':
+                peak_idx = np.argmax(mean_psd_smoothed)
+                peak_freq = freq[peak_idx]
+                peak_val = mean_psd_smoothed[peak_idx]
+               
+                ax.axvline(peak_freq, color='red', linestyle='--', label=f'Peak Freq: {peak_freq:.2f} Hz')
+                
+                ax.text(0.95, 0.95, f'Peak: {peak_val:.2f} dB\n@ {peak_freq:.2f} Hz',
+                        transform=ax.transAxes, ha='right', va='top',
+                        bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.5))
+                
+                ax.legend(loc='upper right')
+
+
+        self.canvas.axes[-1].set_xlabel("Frequency (Hz)")
+        
+        title = (f"PSD - {results['window_count']} valid windows\n"
+                 f"Window: {results['window_len']}s, Shift: {results['shift_len']}s ")
+        self.canvas.axes[0].set_title(title)
+        
+        self.canvas.draw()
+
+    def get_params(self):
+        return {
+            "windows": self.window_len.value(),
+            "shift": self.shift_len.value(),
+            "cft_max": self.cft_max.value(),
+            "cft_min": self.cft_min.value(),
+            "dip_tres": self.dip_tres.value()
+        }
+
+class PolarInputDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calculate Polarization")
+
+        self.layout = QFormLayout(self)
+
+        self.window_len = QSpinBox(self); self.window_len.setRange(1, 3600); self.window_len.setValue(60)
+        self.layout.addRow("Window Length (s):", self.window_len)
+
+        self.shift_len = QSpinBox(); self.shift_len.setRange(1, 3600); self.shift_len.setValue(30)
+        self.layout.addRow("Shift Length (s):", self.shift_len) 
+
+        self.cft_min = QDoubleSpinBox(); self.cft_min.setRange(0.0, 10.0); self.cft_min.setValue(0.3); self.cft_min.setSingleStep(0.1)
+        self.layout.addRow("STA/LTA Min", self.cft_min)
+
+        self.cft_max = QDoubleSpinBox(); self.cft_max.setRange(0.0, 10.0); self.cft_max.setValue(3.0); self.cft_max.setSingleStep(0.1)
+        self.layout.addRow("STA/LTA Max", self.cft_max)
+        
+        self.dip_tres = QSpinBox(); self.dip_tres.setRange(0, 90); self.dip_tres.setValue(45)
+        self.layout.addRow("Dip Threshold (°):", self.dip_tres)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self) 
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        self.layout.addWidget(self.button_box)
+
+    def get_params(self):
+        return {
+            "windows": self.window_len.value(),
+            "shift": self.shift_len.value(),
+            "cft_max": self.cft_max.value(),
+            "cft_min": self.cft_min.value(),
+            "dip_tres": self.dip_tres.value()
+        }
+
+class PolarResultWindow(QDialog):
+    def __init__(self, polar_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Polarization Analysis Result")
+        self.resize(800, 800)
+
+        layout = QVBoxLayout()
+        self.canvas = MplCanvas(self, n_axes=4, sharex=False) 
+        layout.addWidget(self.canvas)
+        self.setLayout(layout)
+        self.plot(polar_data)
+
+    def plot(self, results):
+        if not results:
+            self.canvas.axes[0].text(0.5, 0.5, "No valid polarization data.", ha='center')
+            self.canvas.draw()
+            return
+
+        t_list_utc = results["t_list"]
+        t_list_mpl = mdates.date2num([t.datetime for t in t_list_utc])
+
+        ax_L = self.canvas.axes[0]
+        ax_L.scatter(t_list_mpl, results['L_list'], color='black', s=10)
+        ax_L.axhline(results['L_all'], color='black', label=f"Overall ({results['L_all']:.2f})")
+        ax_L.axhline(results['mean_L'], color='red', linestyle='dashed', label=f"Mean ({results['mean_L']:.2f})")
+        ax_L.set_ylabel('Rectilinearity')
+        ax_L.set_ylim(0, 1)
+        ax_L.legend()
+        ax_L.grid(True, linestyle='--', alpha=0.6)
+
+        ax_dip = self.canvas.axes[1]
+        ax_dip.scatter(t_list_mpl, results['dip_list'], color='black', s=10)
+        ax_dip.axhline(results['dip_all'], color='black')
+        ax_dip.axhline(results['mean_dip'], color='red', linestyle='dashed')
+        ax_dip.set_ylabel('Dip (°)')
+        ax_dip.set_ylim(0, 90)
+        ax_dip.grid(True, linestyle='--', alpha=0.6)
+
+        ax_azimuth = self.canvas.axes[2]
+        ax_azimuth.scatter(t_list_mpl, results['azimuth_list'], color='black', s=10)
+        ax_azimuth.axhline(results['azimuth_all'], color='black')
+        ax_azimuth.axhline(results['mean_azimuth'], color='red', linestyle='dashed')
+        ax_azimuth.set_ylabel('Azimuth (°)')
+        ax_azimuth.set_ylim(-180, 180)
+        ax_azimuth.grid(True, linestyle='--', alpha=0.6)
+
+        ax_eig = self.canvas.axes[3]
+        ax_eig.scatter(t_list_mpl, results['eig_list'], color='black', s=10)
+        ax_eig.axhline(results['eig_all'], color='black')
+        ax_eig.axhline(results['mean_eig'], color='red', linestyle='dashed')
+        ax_eig.set_ylabel('Largest Eigenvalue')
+        ax_eig.set_yscale('log')
+        ax_eig.grid(True, linestyle='--', alpha=0.6)
+        
+
+        title = f"Polarization Analysis - {results['window_count']} valid windows"
+        self.canvas.axes[0].set_title(title)
+        for ax in self.canvas.axes:
+            ax.xaxis_date() 
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        
+        self.canvas.figure.autofmt_xdate()
+        self.canvas.figure.tight_layout() 
+        self.canvas.draw()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -171,6 +390,12 @@ class MainWindow(QMainWindow):
         self.act_vh_analysis = QAction("Calculate V/H Ratio...", self)
         self.act_vh_analysis.setEnabled(False)
 
+        self.act_psd_analysis = QAction("Calculate PSD...", self)
+        self.act_psd_analysis.setEnabled(False)
+
+        self.act_polar_analysis = QAction("Polarization Analysis...", self)
+        self.act_polar_analysis.setEnabled(False)
+
         self.act_about = QAction("About SRPY", self)
 
     def _build_ui(self):
@@ -196,6 +421,8 @@ class MainWindow(QMainWindow):
         analysis_menu = menubar.addMenu("&Analysis")
         analysis_menu.addAction(self.act_spectrogram)
         analysis_menu.addAction(self.act_vh_analysis)
+        analysis_menu.addAction(self.act_psd_analysis)
+        analysis_menu.addAction(self.act_polar_analysis)
 
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction(self.act_about)
@@ -244,7 +471,8 @@ class MainWindow(QMainWindow):
         self.act_about.triggered.connect(self.show_about)
         self.act_spectrogram.triggered.connect(self.show_spectrogram)
         self.act_vh_analysis.triggered.connect(self.show_vh_analysis_dialog)
-
+        self.act_psd_analysis.triggered.connect(self.show_psd_analysis_dialog) 
+        self.act_polar_analysis.triggered.connect(self.show_polar_analysis_dialog)
 
         self.canvas.mpl_connect("scroll_event", self.on_scroll)
         self.canvas.mpl_connect("button_press_event", self.on_mouse_press)
@@ -272,6 +500,8 @@ class MainWindow(QMainWindow):
             self.act_downsample.setEnabled(True)
             self.act_spectrogram.setEnabled(True)
             self.act_vh_analysis.setEnabled(True)
+            self.act_psd_analysis.setEnabled(True)
+            self.act_polar_analysis.setEnabled(True)
 
         except Exception as exc:
             self.text_properties.setPlainText(f"Error: {exc}")
@@ -285,6 +515,8 @@ class MainWindow(QMainWindow):
             self.act_downsample.setEnabled(False)
             self.act_spectrogram.setEnabled(False)
             self.act_vh_analysis.setEnabled(False)
+            self.act_psd_analysis.setEnabled(False)
+            self.act_polar_analysis.setEnabled(False)  
 
     def show_spectrogram(self):
         if not self.stream:
@@ -303,13 +535,135 @@ class MainWindow(QMainWindow):
         dialog = VHInputDialog(self)
         if dialog.exec():
             params = dialog.get_params()
+
+            prog = QProgressDialog("Calculating V/H ratio...", None , 0, 0, self)
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setCancelButton(None)
+            prog.setMinimumDuration(0)
+            prog.show()
+            QApplication.processEvents()
+
             try:
                 vh_data = calculate_vh_data(self.stream, **params)
-                result_window = VHResultWindow(vh_data, self)
-                result_window.resize(800, 600)
-                result_window.exec()
+
+                prog.close()
+
+                if not vh_data or "VperH_array" not in vh_data or len(vh_data["VperH_array"]) == 0 :
+                    QMessageBox.information(self, "No Data", "No valid V/H ratio data could be calculated.")
+                    return
+
+                self.plot_waveform()
+                if vh_data and "valid_windows" in vh_data:
+                    num_windows = vh_data["window_count"]
+
+                    colors = plt.cm.rainbow(np.linspace(0, 1, len(vh_data["valid_windows"])))
+                    self.draw_windows_on_waveform(vh_data["valid_windows"], colors)
+                    result_window = VHResultWindow(vh_data, colors, self)
+
+                    # colors = plt.cm.rainbow(np.linspace(0, 1, num_windows))
+                    # self.draw_windows_on_waveform(vh_data["valid_windows"], colors)
+
+                    result_window = VHResultWindow(vh_data, colors, self)
+                    result_window.resize(800, 600)
+                    result_window.exec()
+                else:
+                    result_window = VHResultWindow(None, [], self)
+                    result_window.resize(400, 200)
+                    result_window.exec()
+
             except Exception as e:
+                prog.close()
+                tb_str = traceback.format_exc()
+                print("="*50)
+                print("Error Details:")
+                print(tb_str)
+
                 QMessageBox.critical(self, "Error", f"Failed to calculate V/H ratio: {e}")
+
+    def show_psd_analysis_dialog(self):
+        if not self.stream:
+            QMessageBox.warning(self, "No Data", "Please open a waveform file first.")
+            return
+
+        dialog = PSDInputDialog(self)
+        if dialog.exec():
+            params = dialog.get_params()
+
+            prog = QProgressDialog("Calculating PSD...", None, 0, 0, self)
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setCancelButton(None)
+            prog.setMinimumDuration(0)
+            prog.show()
+            QApplication.processEvents()
+
+            try:
+                psd_data = calculate_psd_for_gui(self.stream, **params)
+                prog.close()
+
+                if not psd_data:
+                    QMessageBox.information(self, "No Data", "No valid PSD data could be calculated (check parameters).")
+                    return
+
+                self.plot_waveform()
+                colors = plt.cm.rainbow(np.linspace(0, 1, len(psd_data["valid_windows"])))
+                self.draw_windows_on_waveform(psd_data["valid_windows"], colors)
+
+                result_window = PSDResultWindow(psd_data, self)
+                result_window.exec()
+
+            except Exception as e:
+                prog.close()
+                tb_str = traceback.format_exc()
+                print("="*50); print("Error Details:"); print(tb_str)
+                QMessageBox.critical(self, "Error", f"Failed to calculate PSD: {e}")
+
+    def show_polar_analysis_dialog(self):
+        if not self.stream:
+            QMessageBox.warning(self, "No Data", "Please open a waveform file first.")
+            return
+
+        dialog = PolarInputDialog(self)
+        if dialog.exec():
+            params = dialog.get_params()
+
+            prog = QProgressDialog("Calculating Polarization...", None, 0, 0, self)
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setCancelButton(None)
+            prog.setMinimumDuration(0)
+            prog.show()
+            QApplication.processEvents()
+
+            try:
+                polar_data = calculate_polar_for_gui(self.stream, **params)
+                prog.close()
+
+                if not polar_data:
+                    QMessageBox.information(self, "No Data", "No valid polarization data could be calculated (check parameters).")
+                    return
+                
+                self.plot_waveform()
+                colors = plt.cm.rainbow(np.linspace(0, 1, len(polar_data["valid_windows"])))
+                self.draw_windows_on_waveform(polar_data["valid_windows"], colors)
+                
+                result_window = PolarResultWindow(polar_data, self)
+                result_window.exec()
+
+            except Exception as e:
+                prog.close()
+                tb_str = traceback.format_exc()
+                print("="*50); print("Error Details:"); print(tb_str)
+                QMessageBox.critical(self, "Error", f"Failed to calculate Polarization: {e}")
+
+    def draw_windows_on_waveform(self, windows, colors):
+        if not windows:
+            return
+        
+        color_iter = plt.cm.rainbow(np.linspace(0, 1, len(windows)))
+
+        for i, (start_time, end_time) in enumerate(windows):
+            for ax in self.canvas.axes:
+                ax.axvspan(start_time, end_time, color=color_iter[i], alpha=0.3)
+        self.canvas.draw_idle()
 
     def save_file(self):
         if not self.stream:
