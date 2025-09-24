@@ -3,7 +3,7 @@ from obspy import read
 
 def load_mseed(path: str, expected_traces: int = 3):
     basename = os.path.basename(path)
-    stream = read(path)
+    stream = read(path, mmap=True)
 
     if expected_traces is not None and len(stream) != expected_traces:
         raise ValueError(
